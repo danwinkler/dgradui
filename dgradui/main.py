@@ -15,8 +15,11 @@ import pycork
 import requests
 import trimesh
 from PIL import Image
+from requests.adapters import HTTPAdapter, Retry
 from shapely.geometry import Polygon as ShapelyPolygon
 from tqdm import tqdm
+
+from dgradui import model3d
 
 
 def generate_sd_image(
@@ -33,9 +36,24 @@ def generate_sd_image(
         }
     }
 
-    resp = requests.post(
-        url="http://172.22.149.39:7860/v1/txt2img", data=json.dumps(payload)
-    ).json()
+    s = requests.Session()
+
+    retries = Retry(total=5, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
+
+    s.mount("http://", HTTPAdapter(max_retries=retries))
+
+    for i in range(5):
+        try:
+            resp = s.post(
+                url="http://172.22.149.39:7860/v1/txt2img",
+                data=json.dumps(payload),
+                timeout=10,
+            ).json()
+            break
+        except requests.exceptions.ConnectionError as e:
+            print("Connection error, retrying...")
+    else:
+        raise e
 
     if resp.get("images") is None:
         # uh oh, something is wrong. Show what it sent us, it's probably an error of some kind
@@ -64,13 +82,19 @@ def vectorize_app():
 
     def execute(use_cache, threshold=127):
         if "sd_image_cache" in cache and use_cache:
+            print("Using cached image")
             image = cache["sd_image_cache"]
         else:
+            print("Generating image...")
             image = generate_sd_image()
+            print("saving image to cache")
             cache["sd_image_cache"] = image
 
         # Convert to numpy array
         image = np.array(image)
+
+        # Crop to top left quadrant
+        image = image[: image.shape[0] // 2, : image.shape[1] // 2]
 
         # Convert to grayscale
         image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -82,63 +106,50 @@ def vectorize_app():
         # thresh = 255 - thresh
 
         # Find Contours
+        print("Finding contours...")
         contours, hierarchy = cv2.findContours(
             image=thresh, mode=cv2.RETR_TREE, method=cv2.CHAIN_APPROX_TC89_KCOS
         )
 
-        border = 10
+        polygons = []
+        # Convert contours to shapely polygons
+        print("Fixing contours...")
+        for contour in contours:
+            contour = contour.squeeze()
 
-        shape = trimesh.primitives.Box(
-            extents=[image.shape[0] + border * 2, image.shape[1] + border * 2, 10],
-            transform=trimesh.transformations.translation_matrix(
-                [
-                    (image.shape[0] + border * 2) / 2,
-                    (image.shape[1] + border * 2) / 2,
-                    0,
-                ]
-            ),
-        )
+            # Sometimes these contours are idiotic
+            if len(contour) < 3:
+                continue
 
-        shape = None
+            spoly = ShapelyPolygon(contour)
+            spoly = spoly.simplify(1)
 
-        for i, contour in tqdm(enumerate(contours)):
-            try:
-                # Convert to shapely
-                contour_poly = ShapelyPolygon(contour.squeeze())
+            # Just toss out invalid polygons
+            if not spoly.is_valid:
+                continue
 
-                # contour_poly = contour_poly.simplify(5)
+            if spoly.area > 100:
+                # Convert to list of lists
+                polygon = np.array(spoly.exterior.coords).tolist()
+                polygons.append(polygon)
 
-                print(len(contour), contour_poly.area, contour_poly.bounds)
+        print("Generate solidpython definition")
+        model = model3d.extrude_paths_into_base(polygons)
 
-                # Trimesh extrude
-                mesh = trimesh.creation.extrude_polygon(contour_poly, height=20)
+        # For testing
+        # model3d.write_solid_to_file(model, "test.scad")
+        # return image, None
 
-                # Translate
-                tmat = trimesh.transformations.translation_matrix([border, border, -5])
-                mesh.apply_transform(tmat)
-                if shape == None:
-                    shape = mesh
-                else:
-                    shape = subtract(shape, mesh)
-            except Exception as e:
-                traceback.print_exc()
-                print("First fail")
-            # else:
-            #     break
+        print("Generate STL")
+        glb_path = model3d.solid_to_glb(model)
 
-        # Export to file
-        try:
-            temp_model_file = tempfile.NamedTemporaryFile(suffix=".glb", delete=False)
-            shape.export(temp_model_file.name)
-        except Exception as e:
-            traceback.print_exc()
+        return image, glb_path
 
-            return image, None
-
-        return image, temp_model_file.name
-
-    output_image = gr.Image()
-    output_model = gr.Model3D()
+    with gr.Row():
+        with gr.Column():
+            output_image = gr.Image()
+        with gr.Column():
+            output_model = gr.Model3D()
 
     use_cache = gr.Checkbox(value=True, label="Use Cache")
     submit = gr.Button(label="Submit")
